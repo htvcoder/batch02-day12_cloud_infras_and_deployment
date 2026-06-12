@@ -12,17 +12,16 @@
 # Stop:  docker compose down
 # ============================================================
 
-version: "3.9"
-
 services:
 
   # ──────────────────────────────────────
   # Agent Service
   # ──────────────────────────────────────
   agent:
+    image: agent-production
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: 02-docker/production/Dockerfile
       target: runtime          # chỉ build stage "runtime", không build "builder"
     environment:
       - ENVIRONMENT=staging
@@ -31,8 +30,6 @@ services:
       - QDRANT_URL=http://qdrant:6333
       # ❌ KHÔNG đặt secrets trực tiếp ở đây trong production
       # ✅ Dùng: docker secret hoặc env file ngoài git
-    env_file:
-      - .env.local              # secrets riêng, trong .gitignore
     depends_on:
       redis:
         condition: service_healthy
@@ -74,7 +71,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      test: ["CMD", "bash", "-lc", "exec 3<>/dev/tcp/127.0.0.1/6333"]
       interval: 15s
       timeout: 5s
       retries: 3

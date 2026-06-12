@@ -133,3 +133,147 @@ Vì khi app stateless, mọi instance đều có thể xử lý bất kỳ reque
 #### 3. 12-factor nói "dev/prod parity" nghĩa là gì trong thực tế?
 
 Trong thực tế, điều đó nghĩa là môi trường dev nên càng giống production càng tốt về cách cấu hình, dependency, cách chạy app và các service phụ trợ. Càng ít khác biệt thì càng giảm tình huống “chạy trên máy em thì được nhưng lên server thì hỏng”.
+
+## Part 2: Docker
+
+### Exercise 2.1: Dockerfile questions
+
+1. Base image:
+   - `develop`: `python:3.11`
+   - `production`: `python:3.11-slim` cho cả builder và runtime
+2. Working directory:
+   - Cả hai Dockerfile đều dùng `WORKDIR /app`
+3. Why `COPY requirements.txt` first:
+   - Để tận dụng Docker layer cache. Khi source code đổi nhưng dependencies không đổi, layer `pip install` có thể reuse, build nhanh hơn nhiều.
+4. CMD vs ENTRYPOINT:
+   - Cả hai Dockerfile hiện dùng `CMD`, không dùng `ENTRYPOINT`.
+   - `develop`: `CMD ["python", "app.py"]`
+   - `production`: `CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]`
+5. Single-stage or multi-stage:
+   - `develop`: single-stage
+   - `production`: multi-stage, gồm `builder` và `runtime`
+6. `.dockerignore`:
+   - `develop/.dockerignore` có loại trừ `__pycache__/`, `*.pyc`, `venv/`, `env/`, `.venv/`, `.env`, `.env.*`, `.git/`, docs và tests.
+   - Có loại trừ đủ `.env`, `venv/`, `.git`, `__pycache__`.
+   - `production/` ban đầu không có `.dockerignore` riêng, nên mình ghi nhận đúng theo thực tế là file này không tồn tại.
+
+### Exercise 2.2: Build and run develop container
+
+- Build command:
+  ```bash
+  docker build -f 02-docker/develop/Dockerfile -t agent-develop .
+  ```
+- Run command:
+  ```bash
+  docker run --rm -d -p 8000:8000 --name agent-develop-test agent-develop
+  ```
+- Test command:
+  ```bash
+  curl.exe http://localhost:8000/health
+  curl.exe -X POST "http://localhost:8000/ask?question=Hello%20from%20Docker"
+  ```
+- Result:
+  - Build thành công.
+  - Container chạy thành công.
+  - `/health` trả:
+    ```json
+    {"status":"ok","uptime_seconds":13.8,"container":true}
+    ```
+  - `/ask` trả:
+    ```json
+    {"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+    ```
+- Image size:
+  - `agent-develop:latest` có `DISK USAGE` khoảng `1.66GB`, `CONTENT SIZE` khoảng `424MB`.
+
+### Exercise 2.3: Multi-stage build and image size comparison
+
+- Build command:
+  ```bash
+  docker build -f 02-docker/production/Dockerfile -t agent-production .
+  ```
+- Kết quả ban đầu:
+  - Build fail vì `02-docker/production/requirements.txt` không tồn tại.
+- Chỉnh sửa tối thiểu để build/run được:
+  - Thêm `02-docker/production/requirements.txt`.
+  - Sửa `docker-compose.yml` để build context là thư mục gốc repo như README yêu cầu.
+  - Bỏ `env_file: .env.local` vì file này không tồn tại và app hiện không cần secret đó để chạy demo Part 2.
+  - Sửa healthcheck của `qdrant` vì image không có `curl`, làm container bị `unhealthy` dù service đã lắng nghe cổng.
+- Production image:
+  - `agent-production:latest` có `DISK USAGE` khoảng `236MB`, `CONTENT SIZE` khoảng `56.6MB`.
+- Difference:
+  - So với `1.66GB`, image production nhỏ hơn khoảng `1.42GB`.
+  - Tính tương đối theo `DISK USAGE`, production nhỏ hơn khoảng `85.8%`.
+- Why production image is smaller:
+  - Dùng `python:3.11-slim` thay vì `python:3.11`.
+  - Dùng multi-stage để chỉ copy runtime artifacts sang image cuối.
+  - Không giữ lại compiler/build tools trong runtime image.
+  - Có chạy bằng non-root user `appuser`, nên an toàn hơn.
+
+### Exercise 2.4: Docker Compose stack
+
+- Command used:
+  ```bash
+  docker compose -f 02-docker/production/docker-compose.yml up --build -d
+  docker compose -f 02-docker/production/docker-compose.yml ps
+  curl.exe http://localhost/health
+  Invoke-RestMethod -Method Post -Uri 'http://localhost/ask' -ContentType 'application/json' -Body '{"question":"Hello through Nginx"}'
+  docker compose -f 02-docker/production/docker-compose.yml down
+  ```
+- Services started:
+  - `agent`
+  - `nginx`
+  - `redis`
+  - `qdrant`
+- Health check result:
+  - `/health` qua Nginx trả:
+    ```json
+    {"status":"ok","uptime_seconds":10.5,"version":"2.0.0","timestamp":"2026-06-12T10:35:23.797422"}
+    ```
+- Agent endpoint result:
+  - Lần test đầu bằng `curl.exe` trong PowerShell bị `500 Internal Server Error` do JSON body bị quote sai, log agent báo `json.decoder.JSONDecodeError`.
+  - Test lại bằng `Invoke-RestMethod` đi qua Nginx trả `200 OK`; log `production-agent-1` ghi `POST /ask HTTP/1.1 200 OK`.
+  - Output hiển thị ở terminal bị lỗi encoding tiếng Việt, nhưng response đã đi qua stack thành công.
+- Nginx route request như thế nào:
+  - `nginx.conf` dùng `upstream agent_backend { server agent:8000; }`
+  - Route `/` và `/health` được proxy sang service `agent` trong network nội bộ.
+- Service phụ:
+  - Có `redis` và `qdrant` trong compose stack.
+- Architecture diagram:
+
+```text
+Client
+  ↓
+Nginx / Reverse Proxy
+  ↓
+Agent container
+  ↓
+Redis + Qdrant
+```
+
+### Discussion Questions
+
+#### 1. Tại sao `COPY requirements.txt .` rồi `RUN pip install` trước khi `COPY . .`?
+
+Vì Docker cache theo layer. Nếu copy toàn bộ source trước rồi mới `pip install`, chỉ cần đổi một file code nhỏ là layer cài dependencies cũng bị invalidated và phải cài lại từ đầu. Copy `requirements.txt` trước giúp rebuild nhanh hơn khi dependencies không đổi.
+
+#### 2. `.dockerignore` nên chứa những gì? Tại sao `venv/` và `.env` quan trọng?
+
+`.dockerignore` nên chứa các thư mục cache, file build, virtual environment, Git metadata, IDE files, test/docs không cần thiết, và các file secret như `.env`. `venv/` quan trọng vì nếu copy vào image sẽ làm context rất lớn và lẫn dependency của máy local. `.env` quan trọng vì nếu lọt vào image thì secret có thể bị đẩy lên registry hoặc lộ trong quá trình chia sẻ image.
+
+#### 3. Nếu agent cần đọc file từ disk, làm sao mount volume vào container?
+
+Có thể mount volume bằng `docker run -v` hoặc trong `docker-compose.yml`. Ví dụ:
+
+```bash
+docker run -p 8000:8000 -v ${PWD}/data:/app/data agent-develop
+```
+
+Hoặc trong Compose:
+
+```yaml
+services:
+  agent:
+    volumes:
+      - ./data:/app/data
+```
