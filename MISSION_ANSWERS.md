@@ -132,7 +132,7 @@ Vì khi app stateless, mọi instance đều có thể xử lý bất kỳ reque
 
 #### 3. 12-factor nói "dev/prod parity" nghĩa là gì trong thực tế?
 
-Trong thực tế, điều đó nghĩa là môi trường dev nên càng giống production càng tốt về cách cấu hình, dependency, cách chạy app và các service phụ trợ. Càng ít khác biệt thì càng giảm tình huống “chạy trên máy em thì được nhưng lên server thì hỏng”.
+Trong thực tế, điều đó nghĩa là môi trường dev nên càng giống production càng tốt về cách cấu hình, dependency, cách chạy app và các service phụ trợ. Càng ít khác biệt thì càng giảm tình huống "chạy trên máy em thì được nhưng lên server thì hỏng".
 
 ## Part 2: Docker
 
@@ -277,3 +277,279 @@ services:
     volumes:
       - ./data:/app/data
 ```
+
+## Part 3: Cloud Deployment
+
+### Exercise 3.1: Railway deployment
+
+#### Audit trạng thái file
+
+| File | Trạng thái | Nhận xét |
+| --- | --- | --- |
+| `03-cloud-deployment/railway/app.py` | Có | App FastAPI có `/health`, `/ask`, đọc `PORT` từ env |
+| `03-cloud-deployment/railway/Procfile` | Có | Start command hợp lệ, fallback về `8000` khi local |
+| `03-cloud-deployment/railway/railway.toml` | Có | Có `startCommand`, `healthcheckPath`, restart policy |
+| `03-cloud-deployment/railway/requirements.txt` | Có | Tối thiểu đủ cho app mock hiện tại |
+| `03-cloud-deployment/render/render.yaml` | Có | Đã sửa để dùng `rootDir: 03-cloud-deployment/railway` |
+| `03-cloud-deployment/render/app.py` | Thiếu | Không bắt buộc nếu tiếp tục reuse app Railway, nhưng thiếu so với cấu trúc README |
+| `03-cloud-deployment/render/requirements.txt` | Thiếu | Không bắt buộc nếu tiếp tục reuse app Railway, nhưng thiếu so với cấu trúc README |
+| `03-cloud-deployment/production-cloud-run/cloudbuild.yaml` | Có | Đủ để review pipeline ở mức tài liệu |
+| `03-cloud-deployment/production-cloud-run/service.yaml` | Có | Có placeholder cần thay trước khi deploy thật |
+| `03-cloud-deployment/production-cloud-run/README.md` | Thiếu | Nên tạo nếu muốn folder này tự giải thích cách dùng như README mô tả |
+
+#### Railway readiness check
+
+1. App có đọc `PORT` không?
+   - Có. `app.py` dùng `int(os.getenv("PORT", 8000))`.
+2. Start command trong `Procfile` có đúng không?
+   - Có. `web: uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}` phù hợp cho local và cloud.
+3. `railway.toml` có phù hợp không?
+   - Có. Dùng `builder = "NIXPACKS"`, `startCommand = "uvicorn app:app --host 0.0.0.0 --port $PORT"`, `healthcheckPath = "/health"`.
+4. Có endpoint `/health` không?
+   - Có.
+5. Có endpoint `/ask` không?
+   - Có.
+6. Có hardcoded secret không?
+   - Không thấy secret hardcode trong app Railway hiện tại.
+7. Có env var nào phải set trên Railway không?
+   - Bắt buộc thực tế: không có secret bắt buộc cho bản mock hiện tại.
+   - Nên có: `ENVIRONMENT=production` nếu muốn tách môi trường rõ hơn.
+   - Nếu đổi sang LLM thật: cần thêm `OPENAI_API_KEY` hoặc key tương ứng.
+8. Có thể deploy bằng Railway CLI từ folder `03-cloud-deployment/railway` không?
+   - Về cấu hình app: có thể.
+   - Về thao tác thực tế: còn phụ thuộc người dùng login và chạy `railway init` / `railway up`.
+9. Có cần GitHub repo hoặc root directory config gì đặc biệt không?
+   - Nếu deploy bằng Railway CLI từ đúng folder `03-cloud-deployment/railway` thì không cần root directory đặc biệt.
+   - Nếu deploy từ dashboard/GitHub monorepo, người dùng cần trỏ đúng root directory về `03-cloud-deployment/railway`.
+
+#### Local test Railway
+
+- Command chạy app:
+  ```powershell
+  cd 03-cloud-deployment/railway
+  .\.venv\Scripts\python.exe app.py
+  ```
+- Test `/health`:
+  ```powershell
+  curl.exe http://localhost:8000/health
+  ```
+- Test `/ask` ổn định trên PowerShell:
+  ```powershell
+  $body = @{ question = 'Hello from Railway local' } | ConvertTo-Json -Compress
+  Invoke-RestMethod -Method Post -Uri 'http://localhost:8000/ask' -ContentType 'application/json' -Body $body
+  ```
+
+Kết quả audit local ngày `2026-06-12`:
+
+- App chạy được local.
+- `/health` trả:
+  ```json
+  {"status":"ok","uptime_seconds":2.6,"platform":"Railway","timestamp":"2026-06-12T14:56:36.956946+00:00"}
+  ```
+- `/ask` trả:
+  ```json
+  {"question":"Hello from Railway local","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận.","platform":"Railway"}
+  ```
+- Lưu ý quan trọng:
+  - Gọi `/ask` bằng `curl.exe -d ...` trong PowerShell có thể trả `500 Internal Server Error` nếu JSON body bị quote sai.
+  - Đây là lỗi câu lệnh test trên PowerShell, không phải lỗi route `/ask`.
+
+#### Railway CLI trên máy hiện tại
+
+- `node --version`: có, đang trả `v24.15.0`
+- `npm --version`: gọi trực tiếp `npm` trong PowerShell bị chặn bởi execution policy của `npm.ps1`
+- `npm.cmd --version`: chạy được, đang trả `11.16.0`
+- `railway --version`: gọi trực tiếp `railway` trong PowerShell bị chặn bởi execution policy của `railway.ps1`
+- `railway.cmd --version`: chạy được, đang trả `railway 5.12.0`
+
+Kết luận:
+
+- Railway CLI thực ra đã được cài.
+- Blocker hiện tại không phải là "chưa cài CLI", mà là PowerShell đang ưu tiên `.ps1` và execution policy không cho chạy script unsigned.
+- Vì mình không có phiên đăng nhập Railway của người dùng, mình không deploy thật.
+
+Checklist người dùng nên tự chạy:
+
+```powershell
+node --version
+npm.cmd --version
+railway.cmd --version
+Get-Command railway -All
+```
+
+Nếu muốn dùng trực tiếp trong PowerShell mà không gọi `.cmd`, người dùng có thể:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Hoặc đơn giản hơn, dùng luôn:
+
+```powershell
+railway.cmd login
+railway.cmd init
+railway.cmd up
+```
+
+#### Deployment status
+
+- Railway files inspected: xong
+- Railway local test result: PASS
+- Railway deployment status: đã deploy thật thành công trên Railway
+- Public URL: `https://day12-cloud-deployment-part3-production.up.railway.app`
+
+#### Real Railway test result
+
+- Health check command:
+  ```powershell
+  $URL="https://day12-cloud-deployment-part3-production.up.railway.app"
+  curl.exe "$URL/health"
+  ```
+- Health check result:
+  ```json
+  {"status":"ok","uptime_seconds":549.5,"platform":"Railway","timestamp":"2026-06-12T15:25:05.902317+00:00"}
+  ```
+- Kết luận:
+  - Endpoint `/health` đã trả `200 OK`.
+
+- Ask command:
+  ```powershell
+  Invoke-RestMethod `
+    -Uri "$URL/ask" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body '{"question":"Hello from Railway"}'
+  ```
+- Ask result:
+  ```text
+  question: Hello from Railway
+  answer: AI agent đã được deploy lên cloud. Câu hỏi của bạn là: Hello from Railway
+  platform: Railway
+  ```
+- Kết luận:
+  - Endpoint `/ask` đã gọi thành công bằng `Invoke-RestMethod`.
+  - Trong PowerShell, tiếng Việt có thể hiển thị lệch encoding, nhưng API đã trả đúng dữ liệu.
+
+Public URL:
+
+```text
+https://day12-cloud-deployment-part3-production.up.railway.app
+```
+
+### Exercise 3.2: Render deployment
+
+#### Files inspected
+
+- `03-cloud-deployment/render/render.yaml`
+- Không có `03-cloud-deployment/render/app.py`
+- Không có `03-cloud-deployment/render/requirements.txt`
+
+#### Render readiness check
+
+1. `render.yaml` có hợp lệ không?
+   - Về mặt ý tưởng triển khai: hợp lý.
+   - Điểm quan trọng là file này hiện không tự chứa app riêng, mà dùng `rootDir: 03-cloud-deployment/railway`.
+2. Build command/start command có đúng không?
+   - Có, nếu Render build từ `03-cloud-deployment/railway`.
+   - `buildCommand: pip install -r requirements.txt`
+   - `startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT`
+3. App có đọc `PORT` không?
+   - Có, vì app thật đang nằm ở `03-cloud-deployment/railway/app.py`.
+4. Health check path có đúng không?
+   - Có, `/health` tồn tại trên app Railway.
+5. Có hardcoded secret không?
+   - Không. `OPENAI_API_KEY` để `sync: false`, `AGENT_API_KEY` để Render generate.
+6. Có cần root directory config khi deploy từ monorepo không?
+   - Có. Đây là điểm bắt buộc nếu deploy từ repo hiện tại.
+   - File hiện đã encode việc đó qua `rootDir: 03-cloud-deployment/railway`.
+7. Có cần push repo lên GitHub trước không?
+   - Có, nếu dùng Render Blueprint/Dashboard theo luồng chuẩn.
+
+Kết luận Render:
+
+- Có thể deploy được theo hướng hiện tại nếu người dùng có:
+  - GitHub repo chứa code
+  - Render account/dashboard access
+  - Quyền tạo Blueprint service
+- Chưa phải trạng thái "tự chứa đầy đủ trong `render/`" theo cấu trúc README, vì thiếu `app.py` và `requirements.txt` riêng trong folder này.
+- Nếu muốn bài nộp bám đúng README hơn, có hai hướng:
+  - Giữ nguyên cấu hình hiện tại và ghi rõ `render/` chỉ chứa blueprint, app thật reuse từ `railway/`
+  - Hoặc tạo `render/app.py` và `render/requirements.txt` riêng để folder `render/` tự đứng độc lập
+
+Thông tin còn cần từ người dùng nếu chọn Render:
+
+- GitHub repo URL
+- Render account/dashboard access
+- Tên service/public URL sau deploy
+- Env vars thật nếu bỏ mock
+
+Public URL:
+
+```text
+Chưa có — cần người dùng push repo lên GitHub và deploy trên Render dashboard.
+```
+
+### Exercise 3.3: Cloud Run review
+
+#### Files inspected
+
+- `03-cloud-deployment/production-cloud-run/cloudbuild.yaml`
+- `03-cloud-deployment/production-cloud-run/service.yaml`
+- Thiếu `03-cloud-deployment/production-cloud-run/README.md`
+
+#### Cloud Run review summary
+
+- `cloudbuild.yaml` đủ để review một pipeline kiểu test -> build -> push -> deploy.
+- `service.yaml` đủ để review service definition và các ý tưởng production như:
+  - `minScale=1`, `maxScale=10`
+  - `containerConcurrency=80`
+  - health probe
+  - secret từ Secret Manager
+
+Các điểm còn thiếu hoặc còn placeholder:
+
+1. `service.yaml` vẫn dùng image placeholder:
+   - `gcr.io/PROJECT_ID/ai-agent:latest`
+2. Tên project/region/service cần người dùng xác nhận:
+   - `PROJECT_ID`
+   - region hiện đang để `asia-southeast1`
+   - service name hiện là `ai-agent`
+3. `cloudbuild.yaml` cần môi trường GCP thật:
+   - Cloud Build
+   - Cloud Run
+   - Artifact/Container Registry
+   - Secret Manager
+   - quyền IAM phù hợp
+4. `startupProbe` đang gọi `/ready`
+   - App Railway hiện tại không có `/ready`
+   - Vì vậy cấu hình Cloud Run này mới ở mức review/tài liệu, chưa phải cấu hình deploy chắc chắn cho chính app mock Part 3 hiện tại
+5. Thiếu `README.md` riêng trong folder `production-cloud-run/`
+   - Nên tạo nếu muốn người chấm hoặc người dùng khác biết chính xác cách áp dụng hai file YAML này
+
+Kết luận Cloud Run:
+
+- Đủ để review ý tưởng CI/CD pipeline.
+- Chưa đủ để coi là sẵn sàng deploy thật nếu chưa thay placeholder và chưa xác nhận app có `/ready`.
+- Cần thêm GCP account/project ID/region/secret setup nếu muốn đi tiếp.
+
+### Platform comparison
+
+| Platform | Best for | Pros | Cons | When to use |
+| --- | --- | --- | --- | --- |
+| Railway | MVP, demo, học nhanh | Setup nhanh, local app đã pass smoke test | Cần login thủ công, còn phụ thuộc account người dùng | Ưu tiên số 1 cho Part 3 hiện tại |
+| Render | Demo có IaC | Có `render.yaml`, dễ review hạ tầng | Cần GitHub repo và dashboard, folder `render/` chưa tự chứa app | Dùng khi người dùng muốn deploy bằng Blueprint |
+| Cloud Run | Review hoặc production hướng GCP | CI/CD và secret management rõ ràng hơn | Còn placeholder, thiếu README, probe `/ready` chưa khớp app | Chỉ nên làm tiếp khi có GCP project thật |
+
+### Discussion Questions
+
+#### 1. Tại sao serverless không phải lúc nào cũng tốt cho AI agent?
+
+AI agent thường có dependency nặng, thời gian xử lý dài hơn API CRUD thông thường, đôi khi cần streaming hoặc giữ kết nối lâu hơn. Trong các trường hợp đó, mô hình serverless dễ bị cold start, timeout hoặc cho trải nghiệm không ổn định bằng service hoặc container chạy lâu hơn.
+
+#### 2. Cold start là gì?
+
+Cold start là độ trễ phát sinh khi platform phải khởi động instance hoặc container mới trước khi xử lý request đầu tiên. Với người dùng cuối, nó làm request đầu tiên chậm hơn đáng kể và khiến UX có cảm giác "lúc nhanh lúc chậm".
+
+#### 3. Khi nào nên upgrade từ Railway lên Cloud Run?
+
+Khi app không còn chỉ là demo nữa mà bắt đầu cần autoscaling rõ ràng hơn, secret management chuẩn hơn, CI/CD chặt hơn, logging hoặc monitoring tốt hơn, hoặc đã có hạ tầng GCP sẵn để vận hành lâu dài.
