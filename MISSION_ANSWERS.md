@@ -813,3 +813,196 @@ Không có một con số đúng cho mọi hệ thống, nhưng nên bắt đầ
 #### 3. Nếu API key bị lộ, bạn phát hiện và xử lý như thế nào?
 
 Trước hết phải rotate key ngay và vô hiệu hóa key cũ. Sau đó kiểm tra log để tìm dấu hiệu lạm dụng như request tăng đột biến, IP lạ, hoặc pattern gọi bất thường. Tiếp theo là giới hạn thiệt hại bằng rate limit, cost guard, và nếu cần thì tạm chặn endpoint. Cuối cùng nên rà lại nơi key bị lộ, cập nhật quy trình secret handling, và chuyển dần sang cơ chế an toàn hơn nếu API key đơn thuần không còn đủ.
+
+## Part 5: Scaling & Reliability
+
+### Scope note
+
+Thư mục `05-scaling-reliability/` không có README riêng, nên phần này được đối chiếu theo:
+
+- `PLAN.md`
+- `CODE_LAB.md`
+- root `README.md`
+- source code thật trong `05-scaling-reliability/`
+
+### Exercise 5.1: Health checks
+
+#### Develop app
+
+File kiểm tra: `05-scaling-reliability/develop/app.py`
+
+- Có `GET /health`
+- Có `GET /ready`
+- `/health` trả thông tin liveness như `status`, `uptime_seconds`, `version`, `environment`, `timestamp`
+- `/ready` dùng cờ `_is_ready`; khi chưa ready sẽ trả `503`, khi ready sẽ trả `200`
+
+Nhận xét:
+
+- Phần develop đã đáp ứng đúng ý tưởng health/readiness checks của bài lab
+- `psutil` là optional; nếu không có module này app vẫn có thể chạy
+
+#### Production app
+
+File kiểm tra: `05-scaling-reliability/production/app.py`
+
+- Có `GET /health`
+- Có `GET /ready`
+- `/health` báo thêm `instance_id`, `storage`, `redis_connected`
+- `/ready` sẽ ping Redis nếu Redis đang được dùng; nếu ping lỗi sẽ trả `503`
+
+Kết luận:
+
+- Yêu cầu health/readiness có trong cả bản develop và production
+
+### Exercise 5.2: Graceful shutdown
+
+File kiểm tra: `05-scaling-reliability/develop/app.py`
+
+Điểm đã có:
+
+- Dùng `lifespan` để log startup/shutdown
+- Có signal handler cho `SIGTERM` và `SIGINT`
+- Có cờ `_is_shutting_down` để ngừng nhận request mới
+- Có middleware đếm `in_flight_requests`
+- Có chờ hoàn tất request đang chạy trước khi thoát
+- `uvicorn.run(...)` có `timeout_graceful_shutdown=30`
+
+Kết luận:
+
+- Bản develop đã implement graceful shutdown khá đầy đủ theo yêu cầu bài lab
+
+Ghi chú:
+
+- Bản production hiện chỉ có `lifespan` logging, chưa có signal handling rõ như develop
+
+### Exercise 5.3: Stateless design
+
+File kiểm tra: `05-scaling-reliability/production/app.py`
+
+Thiết kế hiện tại:
+
+- Session/history không nằm cố định trong một biến `conversation_history` kiểu global dict duy nhất cho multi-instance path
+- App ưu tiên lưu session vào Redis qua:
+  - `save_session(...)`
+  - `load_session(...)`
+  - key dạng `session:{session_id}`
+- Có các endpoint:
+  - `POST /chat`
+  - `GET /chat/{session_id}/history`
+  - `DELETE /chat/{session_id}`
+
+Điểm cần ghi đúng theo code:
+
+- Production app không có `POST /ask`; bài demo stateless thực tế dùng `POST /chat`
+- Nếu Redis không sẵn sàng hoặc package `redis` không import được, app fallback sang `_memory_store`
+
+Kết luận:
+
+- Hướng thiết kế stateless là đúng
+- Nhưng trạng thái thực tế chỉ là `partial`, vì khi fallback sang in-memory thì không còn đúng nghĩa scalable/stateless giữa nhiều instances
+
+### Exercise 5.4: Load balancing
+
+File kiểm tra:
+
+- `05-scaling-reliability/production/docker-compose.yml`
+- `05-scaling-reliability/production/nginx.conf`
+
+Những gì có trong code/config:
+
+- Có service `agent`
+- Có service `redis`
+- Có service `nginx`
+- Nginx proxy tới upstream `agent`
+- Test script `production/test_stateless.py` gọi qua `http://localhost:8080`
+
+Các lỗi cấu hình mình phát hiện và đã sửa:
+
+1. Compose cũ trỏ sai tới `05-scaling-reliability/advanced/Dockerfile`
+2. Compose cũ tham chiếu `.env.local` không tồn tại
+3. Bổ sung `05-scaling-reliability/production/Dockerfile`
+4. Bổ sung `05-scaling-reliability/production/requirements.txt`
+5. Chuyển cách scale rõ ràng sang `docker compose up --build --scale agent=3`
+
+Kết luận:
+
+- Ở mức repo/config, phần load balancing đã được chuẩn bị đúng hướng hơn sau khi sửa
+- Chưa có bằng chứng runtime thật vì Docker daemon trên máy hiện tại không chạy
+
+### Exercise 5.5: Test stateless
+
+File kiểm tra: `05-scaling-reliability/production/test_stateless.py`
+
+Script hiện có sẽ:
+
+1. Tạo session qua `POST /chat`
+2. Gửi nhiều câu hỏi liên tiếp
+3. Ghi nhận `served_by`
+4. Gọi `GET /chat/{session_id}/history`
+5. Kiểm tra history còn giữ được
+
+Nhận xét quan trọng:
+
+- Script này đang chứng minh session continuity qua nhiều request
+- Script hiện không thật sự tự kill random instance như mô tả trong `CODE_LAB.md`
+- Vì vậy mình ghi nhận đúng là `script ready`, chưa khẳng định đã hoàn tất bài test kill-instance scenario
+
+### Local verification status
+
+Kiểm tra nhanh trên máy hiện tại:
+
+- `fastapi`: có
+- `uvicorn`: có
+- `redis` Python package: chưa có
+- `psutil`: chưa có
+
+Smoke check local bằng `FastAPI TestClient`:
+
+- Develop:
+  - `GET /health` -> `200`
+  - `GET /ready` -> `200`
+  - `POST /ask?question=hello from develop` -> `200`
+- Production:
+  - `GET /health` -> `200`
+  - `GET /ready` -> `200`
+  - `POST /chat` -> `200`
+  - `GET /chat/{session_id}/history` -> `200`
+
+Ghi chú:
+
+- Với develop, nếu test trước khi startup lifecycle hoàn tất thì `/ready` và `/ask` có thể tạm thời trả `503`, đây là hành vi phù hợp với readiness gate
+- Với production, local smoke test hiện đang chạy trên fallback `in-memory`, chưa phải Redis-backed runtime thật
+- Để tránh lỗi hiển thị tiếng Việt/Unicode trên console Windows, mình dùng `PYTHONIOENCODING=utf-8` khi chạy smoke check
+
+Docker CLI có sẵn, nhưng `docker info` lỗi:
+
+```text
+failed to connect to the docker API at npipe:////./pipe/docker_engine; check if the path is correct and if the daemon is running: open //./pipe/docker_engine: The system cannot find the file specified.
+```
+
+Ngoài ra còn có cảnh báo:
+
+```text
+WARNING: Error loading config file: open C:\Users\Lenovo\.docker\config.json: Access is denied.
+```
+
+Theo đúng yêu cầu, mình không sửa Docker bên ngoài repo và không giả lập kết quả runtime.
+
+### Part 5 overall status
+
+| Requirement | Status | Notes |
+| --- | --- | --- |
+| `/health` | PASS | Có ở develop và production |
+| `/ready` | PASS | Có ở develop và production |
+| Graceful shutdown | PASS ở develop | Production chưa tương đương develop |
+| Stateless Redis design | PARTIAL | Có Redis path, nhưng có fallback in-memory |
+| Multi-instance load balancing | CONFIG READY | Có compose + nginx sau khi sửa path/config |
+| Runtime scale test | NOT VERIFIED | Docker daemon không chạy |
+| `test_stateless.py` | PRESENT | Chưa chứng minh kill-instance scenario thật |
+
+Kết luận cuối:
+
+- Part 5 đã được review và sửa các lỗi cấu hình rõ ràng trong repo
+- Ở mức source code, develop đáp ứng tốt health/readiness/graceful shutdown
+- Production thể hiện đúng hướng stateless với Redis, nhưng vẫn có fallback in-memory nên chưa thể gọi là fully proven scalable runtime
+- Trạng thái trung thực nhất hiện tại là: `review/config fixed + local smoke-ready`, chưa có `full Docker runtime PASS`
