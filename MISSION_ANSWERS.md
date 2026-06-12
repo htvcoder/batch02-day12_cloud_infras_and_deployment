@@ -553,3 +553,263 @@ Cold start là độ trễ phát sinh khi platform phải khởi động instanc
 #### 3. Khi nào nên upgrade từ Railway lên Cloud Run?
 
 Khi app không còn chỉ là demo nữa mà bắt đầu cần autoscaling rõ ràng hơn, secret management chuẩn hơn, CI/CD chặt hơn, logging hoặc monitoring tốt hơn, hoặc đã có hạ tầng GCP sẵn để vận hành lâu dài.
+
+## Part 4: API Gateway & Security
+
+### Exercise 4.1: API Key Authentication
+
+#### Files inspected
+
+- `04-api-gateway/develop/app.py`
+- `04-api-gateway/develop/requirements.txt`
+- `04-api-gateway/develop/utils/mock_llm.py`
+- Ghi nhận thực tế: ban đầu repo không có `04-api-gateway/develop/test_auth.py` như README mô tả, nên mình đã bổ sung script test tối thiểu `04-api-gateway/develop/test_auth.py`
+
+#### Implementation summary
+
+- API key source:
+  - Đọc từ environment variable `AGENT_API_KEY`
+  - Có fallback demo trong code là `demo-key-change-in-production`
+- Header used:
+  - `X-API-Key`
+- No key result:
+  - `401 Unauthorized`
+- Invalid key result:
+  - Sau khi chỉnh tối thiểu để khớp README/Part 4, hiện trả `401 Unauthorized`
+- Valid key result:
+  - Request được đi tiếp tới mock agent và trả `200 OK`
+- Health endpoint:
+  - Có `GET /health`
+- Ask endpoint:
+  - Có `POST /ask`
+- Ghi chú sửa tối thiểu:
+  - `develop/app.py` ban đầu nhận `question` qua query parameter, nên lệnh JSON body trong README trả `422`
+  - Mình đã đổi sang body model để khớp README và để test thực tế pass ổn định hơn trên PowerShell
+
+#### Test results
+
+- Command used:
+  ```powershell
+  cd 04-api-gateway/develop
+  python -m pip install -r requirements.txt
+  $env:AGENT_API_KEY="my-secret-key"
+  python app.py
+  ```
+- Result without key:
+  ```powershell
+  Invoke-RestMethod -Uri "http://localhost:8011/ask" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body (@{ question = "hello" } | ConvertTo-Json -Compress)
+  ```
+  - Kết quả: `401`
+  - Detail: `Missing API key. Include header: X-API-Key: <your-key>`
+- Result with valid key:
+  ```powershell
+  Invoke-RestMethod -Uri "http://localhost:8011/ask" `
+    -Method Post `
+    -Headers @{ "X-API-Key" = "my-secret-key" } `
+    -ContentType "application/json" `
+    -Body (@{ question = "hello" } | ConvertTo-Json -Compress)
+  ```
+  - Kết quả: `200 OK`
+  - Response thực tế:
+    ```json
+    {"question":"hello","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}
+    ```
+- Test script:
+  ```powershell
+  python test_auth.py
+  ```
+  - Kết quả: `PASS develop auth`
+  - Script kiểm tra 4 case:
+    - `/health` trả `200`
+    - `/ask` không có key trả `401`
+    - `/ask` key sai trả `401`
+    - `/ask` key đúng trả `200`
+
+### Exercise 4.2: JWT Authentication
+
+#### Files inspected
+
+- `04-api-gateway/production/app.py`
+- `04-api-gateway/production/auth.py`
+- `04-api-gateway/production/requirements.txt`
+- Ghi nhận thực tế: ban đầu repo không có `04-api-gateway/production/test_advanced.py` như README mô tả, nên mình đã bổ sung script test tối thiểu `04-api-gateway/production/test_advanced.py`
+
+#### Implementation summary
+
+- Token endpoint:
+  - `POST /auth/token`
+- Demo user:
+  - `student / demo123`
+  - `teacher / teach456`
+- JWT được tạo trong file nào?
+  - `04-api-gateway/production/auth.py`
+- Token type:
+  - Bearer JWT
+- Protected endpoint:
+  - `POST /ask`
+- Header dùng để truyền token:
+  - `Authorization: Bearer <token>`
+- Missing token result:
+  - `401 Unauthorized`
+- Invalid token result:
+  - `403 Forbidden`
+- Expired token result:
+  - `401 Unauthorized`
+- Ghi chú sửa tối thiểu:
+  - `production/app.py` ban đầu bị `500 Internal Server Error` do middleware gọi `response.headers.pop(...)` trên `MutableHeaders`
+  - Mình đã sửa tối thiểu thành `del response.headers["server"]` nếu header tồn tại
+
+#### Test results
+
+- Token command:
+  ```powershell
+  $TOKEN_RESPONSE = Invoke-RestMethod `
+    -Uri "http://localhost:8012/auth/token" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body '{"username":"student","password":"demo123"}'
+  ```
+- Token result:
+  - Thành công
+  - Response có `access_token`, `token_type = bearer`, `expires_in_minutes = 60`
+  - Không ghi token thật vào file này
+- Ask with token result:
+  ```powershell
+  Invoke-RestMethod `
+    -Uri "http://localhost:8012/ask" `
+    -Method Post `
+    -Headers @{ Authorization = "Bearer <token>" } `
+    -ContentType "application/json" `
+    -Body '{"question":"what is docker?"}'
+  ```
+  - Kết quả: `200 OK`
+  - Response thực tế:
+    ```json
+    {"question":"what is docker?","answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!","usage":{"requests_remaining":9,"budget_remaining_usd":0.000019}}
+    ```
+- Ask without token result:
+  - Kết quả: `401`
+  - Detail: `Authentication required. Include: Authorization: Bearer <token>`
+- Smoke script:
+  ```powershell
+  python test_advanced.py
+  ```
+  - Kết quả: `PASS production smoke`
+
+### Exercise 4.3: Rate Limiting
+
+#### Files inspected
+
+- `04-api-gateway/production/rate_limiter.py`
+- `04-api-gateway/production/test_advanced.py`
+
+#### Implementation summary
+
+- Algorithm/storage:
+  - In-memory sliding window counter dùng `deque` theo từng user
+- Limit:
+  - User thường: `10 request / 60 giây`
+  - Admin: `100 request / 60 giây`
+- Keying strategy:
+  - Theo `username` lấy từ JWT payload
+- Exceeded result:
+  - `429 Too Many Requests`
+  - Có thêm header như `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`
+- Rate limiter nằm ở file nào?
+  - `04-api-gateway/production/rate_limiter.py`
+
+#### Test results
+
+- Command used:
+  ```powershell
+  python test_advanced.py --test rate-limit
+  ```
+- Result:
+  - Pass
+  - Script hit `429` tại request thứ `9`
+  - Response:
+    ```json
+    {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":33}}
+    ```
+- Ghi chú:
+  - Lần smoke test `/ask` trước đó đã tiêu tốn 1 request, nên vòng lặp rate-limit chạm `429` ở request thứ `9` thay vì `11`
+
+### Exercise 4.4: Cost Guard
+
+#### Files inspected
+
+- `04-api-gateway/production/cost_guard.py`
+
+#### Implementation summary
+
+- Budget model:
+  - Per-user daily budget: `$1/ngày`
+  - Global daily budget: `$10/ngày`
+- Spending tracking:
+  - Track `input_tokens`, `output_tokens`, `request_count`, `cost_usd`
+  - Giá token đang là mock/reference cost
+- Exceeded result:
+  - Vượt budget user: `402 Payment Required`
+  - Vượt global budget: `503 Service Unavailable`
+- Storage:
+  - In-memory
+- Notes:
+  - Có warning khi dùng quá `80%` budget
+  - Đây là mock/in-memory, chưa dùng Redis hay database
+
+#### Test results
+
+- Cost guard không dễ hit qua API với budget mặc định `$1/ngày`, vì mock request quá rẻ
+- Mình đã test trực tiếp ở mức module bằng cách khởi tạo `CostGuard(daily_budget_usd=0.000001, global_daily_budget_usd=1.0)` rồi ghi usage đủ lớn
+- Kết quả:
+  - `check_budget("demo")` raise `HTTPException 402`
+  - Detail:
+    ```text
+    {'error': 'Daily budget exceeded', 'used_usd': 0.00075, 'budget_usd': 1e-06, 'resets_at': 'midnight UTC'}
+    ```
+
+### Security Flow
+
+Flow README mô tả:
+
+```text
+Request
+  → Auth Check
+  → Rate Limit
+  → Input Validation
+  → Cost Check
+  → Agent
+```
+
+Flow theo code thực tế:
+
+```text
+Request
+  → FastAPI/Pydantic parse + validate body
+  → JWT/Auth dependency
+  → Rate Limit
+  → Cost Check
+  → Agent
+```
+
+Nhận xét:
+
+- README đặt Input Validation sau Auth Check, nhưng trong FastAPI body validation diễn ra ở framework layer trước khi vào endpoint handler.
+- Với request JSON hợp lệ, luồng bảo vệ trong code là: Auth → Rate Limit → Cost Check → Agent.
+
+### Discussion Questions
+
+#### 1. Khi nào nên dùng API Key vs JWT vs OAuth2?
+
+API Key phù hợp cho service nội bộ, B2B đơn giản hoặc MVP khi chỉ cần xác thực máy gọi sang máy nhận. JWT phù hợp khi cần đại diện cho user cụ thể, mang theo claim như `role`, `sub`, và muốn giữ auth stateless. OAuth2 phù hợp khi có đăng nhập qua bên thứ ba, phân quyền ủy quyền phức tạp, hoặc cần chuẩn hóa luồng authorization cho nhiều ứng dụng và nhiều loại client.
+
+#### 2. Rate limit nên đặt bao nhiêu request/phút cho một AI agent?
+
+Không có một con số đúng cho mọi hệ thống, nhưng nên bắt đầu từ hành vi thật của use case. Với user thường, mức như `10 request/phút` là hợp lý cho demo hoặc lab vì đủ dùng mà vẫn hạn chế spam. Với user nội bộ hoặc admin, có thể cao hơn. Quan trọng là phải cân bằng giữa UX, chi phí LLM, và khả năng chịu tải của backend.
+
+#### 3. Nếu API key bị lộ, bạn phát hiện và xử lý như thế nào?
+
+Trước hết phải rotate key ngay và vô hiệu hóa key cũ. Sau đó kiểm tra log để tìm dấu hiệu lạm dụng như request tăng đột biến, IP lạ, hoặc pattern gọi bất thường. Tiếp theo là giới hạn thiệt hại bằng rate limit, cost guard, và nếu cần thì tạm chặn endpoint. Cuối cùng nên rà lại nơi key bị lộ, cập nhật quy trình secret handling, và chuyển dần sang cơ chế an toàn hơn nếu API key đơn thuần không còn đủ.
